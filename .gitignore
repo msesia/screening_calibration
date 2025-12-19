@@ -1,0 +1,10 @@
+*.aux
+*.gz
+*.bbl
+*.blg
+*.out
+*.log
+*.pdf
+*/auto/
+data/
+code/experiments/results/
