@@ -1,246 +1,362 @@
-this_file <- parent.frame(2)$ofile  # works when sourced via `source()`
-this_dir <- dirname(this_file)
-
-screening_conformal <- function(data.test, data.cal, weights.cal, surv_model,
-                                screening_time, screening_prob, screening_crit,
-                                lambda.scores=NULL, data.tune=NULL, weights.tune=NULL, refit_model=FALSE,
-                                p.sel.accept = 0.5) {
-
-    ## Tune the lambda parameter using tuning data (if provided)
-    if(is.null(lambda.scores) && !is.null(data.tune) && !is.null(weights.tune)) {
-        lambda_grid <- unique(c(0,sort(quantile(data.cal$time, seq(0.5, 0.95, length.out=50)))))
-        lambda.tuning <- .conformal_autotune(data.tune, weights.tune, surv_model$clone(),
-                                             screening_time, screening_prob, screening_crit,
-                                             refit_model=refit_model, lambda_grid=lambda_grid, criterion="fisher", n_repeats=5)
-        lambda.scores <- lambda.tuning$lambda_opt
-
-        ##cat(sprintf("best lambda: %.2f.\n", lambda.scores))
-    } else if (is.null(lambda.scores)) {
-        lambda.scores <- 0
-    }
-
-    if(screening_crit == "low risk") {
-        alpha <- 1 - screening_prob
-        score_type <- "survival"
-    } else {
-        alpha <- screening_prob
-        score_type <- "one_minus_survival"
-    }
-
-    ## Compute conformity scores for calibration data
-    idx.cal.events <- which(data.cal$status==1)
-    scores.cal <- compute_scores_from_model(data.cal[idx.cal.events,], surv_model,
-                                            times = data.cal$time[idx.cal.events] + lambda.scores,
-                                            score_type = score_type)
-    if(screening_crit == "low risk") {
-        scores.cal[data.cal$time[idx.cal.events] > screening_time] <- 0
-    } else {
-        scores.cal[data.cal$time[idx.cal.events] < screening_time] <- 0
-    }
-
-    ## Compute conformity scores for test data
-    scores.test <- compute_scores_from_model(data.test, surv_model, times = screening_time + lambda.scores, score_type = score_type)
-
-    ## Pre-compute denominator for conformal p-values
-    idx.event.cal <- which(data.cal$status==1)
-    den <- 1+nrow(data.cal)
-
-    ## Initialize matrix for p-values
-    n.test <- nrow(data.test)
-    time_points <- c(screening_time)
-
-    ## Compute score comparisons efficiently using outer()
-    score_comparison <- outer(scores.cal, scores.test, FUN = match.fun(">="))
-
-    ## Compute the numerator using matrix operations
-    num_values <- 1 + colSums(weights.cal[idx.event.cal] * score_comparison, na.rm = TRUE)
-    ## Compute and store p-values for the current horizon
-    pvals <- pmin(1, num_values / den)
-
-    ## Apply BH
-    pvals.adj <- p.adjust(pvals, method = "BH")
-    sel <- which(pvals.adj<=alpha)
-
-    ## Check stability of selections. Remove if too unstable
-    p.sel.boot <- mean(sapply(1:1000, function(b) {
-        sum(p.adjust(sample(pvals, replace=T), method = "BH")<0.1)>0
-    }))
-    if(p.sel.boot<p.sel.accept && length(sel)>0) {
-        sel.stable <- c()
-    } else {
-        sel.stable <- sel
-    }
-    return(list(selections = sel, selections.stable = sel.stable,
-                p.values = pvals, p.values.adj = pvals.adj, lambda.scores = lambda.scores,
-                p.sel.boot=p.sel.boot))
-}
-
-## ------------------------------------------------------------
-## FAST conformal autotune: precompute curves, interpolate for λ
-## ------------------------------------------------------------
-## data.tune, weights.tune : tuning frame + IPC weights (same rows)
-## surv_model              : trainable model with $predict(data, times)$predictions -> n x |times|
-## screening_time/_prob/_crit : passed-through configuration
-## lambda_grid             : vector of λ (if NULL → data-driven default)
-## n_repeats               : number of random splits
-## criterion               : "bh" = #discoveries after BH; "fisher" = -2*sum log p
-## refit_model             : refit model on train split each repeat?
-## seed                    : RNG seed
-## grid_size               : #time points for precomputed grid (trade speed/accuracy)
+## ============================================================
+## Conformal screening with FDR control (paper Section 4).
 ##
-## Returns: list(lambda_opt, summary, per_repeat)
-.conformal_autotune <- function(
-  data.tune, weights.tune,
-  surv_model,
-  screening_time, screening_prob, screening_crit,
-  lambda_grid = NULL,
-  n_repeats = 5,
-  criterion = c("bh","fisher"),
-  refit_model = FALSE,
-  seed = NULL,
-  grid_size = 400
-) {
-  criterion <- match.arg(criterion)
-  if (!is.null(seed)) set.seed(seed)
+## Flavor-agnostic: the IPCW p-values (19)/(22) and the augmented ones
+## (24) are the SAME computation applied to different pseudo-outcomes.
+##
+## Because R(x,t) = Shat(t + gamma | x) I(t <= t0) is non-increasing in t,
+## {R(X,T) >= z} = {T <= b_z(X)} with b_z of (23), so
+##
+##   H(z) = P[R(X,T) >= z] = P[T <= b_z(X)]
+##
+## has the same form as theta(lambda) with t0 replaced by the
+## covariate-dependent horizon b_z(X).  Hence
+##
+##   Hhat(z) = n^{-1} sum_i Psi_i( b_z(X_i) )
+##
+## for ANY flavor: with "et" this is exactly the weighted rank of (19),
+## with "dr" it is the augmented estimator of Section 4.3.  The p-value is
+##
+##   phat(z) = Pi( (1 + n Hhat(z)) / (1 + n) ),
+##   Pi f(z) = min{1, sup_{z' >= z} f(z')}                            (24)
+##
+## which is a no-op for "et" (already non-increasing in z) and the least
+## non-increasing majorant for "dr".
+##
+## Depends on: pseudo_outcomes.R, utils_weights_scores.R.
+## ============================================================
 
-  # default λ grid (upper tail of observed times)
-  if (is.null(lambda_grid)) {
-    lambda_grid <- sort(unique(stats::quantile(data.tune$time, seq(0, 1, length.out = 200))))
-  }
-  G <- length(lambda_grid)
-  N <- nrow(data.tune)
 
-  # split proportions
-  split_fracs <- if (refit_model) c(train=.7, cal=.15, test=.15) else c(train=0, cal=.5, test=.5)
-  stopifnot(length(split_fracs)==3L, abs(sum(split_fracs)-1) < 1e-8)
-
-  split_once <- function(N, fracs) {
-    idx <- sample.int(N)
-    n_tr <- max(0L, floor(fracs["train"] * N))
-    n_ca <- max(1L, floor(fracs["cal"]   * N))
-    tr <- if (n_tr>0) idx[seq_len(n_tr)] else integer(0)
-    ca <- idx[seq_len(n_ca) + n_tr]
-    te <- setdiff(idx, c(tr, ca))
-    list(train=tr, cal=ca, test=te)
-  }
-
-  # gating rule (matches your earlier code)
-  .gate_cal <- function(scores_cal_ev, time_ev, t_screen, crit) {
-    out <- scores_cal_ev
-    if (crit == "low risk")  out[ time_ev >  t_screen] <- 0
-    if (crit == "high risk") out[ time_ev <  t_screen] <- 0
-    out
-  }
-
-  # per-repeat stats
-  r_stats <- vector("list", n_repeats)
-
-  for (rep in seq_len(n_repeats)) {
-    sp <- split_once(N, split_fracs)
-
-    # (re)fit model
-    if (refit_model && length(sp$train)>0) {
-      surv_model$fit(stats::as.formula(Surv(time, status) ~ .), data = data.tune[sp$train, , drop=FALSE])
-    }
-
-    # split data/weights
-    data_cal   <- data.tune[sp$cal,  , drop=FALSE]
-    data_test  <- data.tune[sp$test, , drop=FALSE]
-    w_cal_full <- weights.tune[sp$cal]
-    time_cal   <- data_cal$time
-    status_cal <- data_cal$status
-    idx_ev_cal <- which(status_cal == 1L)
-    n_cal      <- nrow(data_cal)
-    n_test     <- nrow(data_test)
-
-    # If no events in cal or no test rows → skip safely
-    if (length(idx_ev_cal) == 0L || n_test == 0L) {
-      r_stats[[rep]] <- data.frame(rep=rep, lambda=lambda_grid, stat=0)
-      next
-    }
-    time_ev <- time_cal[idx_ev_cal]
-    w_cal_ev <- w_cal_full[idx_ev_cal]
-
-    # ----- time grid (single) -----
-    # cover [0, max target time] where targets are time_ev + max(λ) and screening_time + max(λ)
-    t_max <- max(0, max(time_ev, na.rm=TRUE) + max(lambda_grid, 0), screening_time + max(lambda_grid, 0))
-    t_grid <- seq(0, t_max, length.out = grid_size)
-
-    # ----- precompute survival curves once per split -----
-    # cal EVENTS only (we only need event rows for cal)
-    surv_cal_ev <- surv_model$predict(data_cal[idx_ev_cal, , drop=FALSE], t_grid)$predictions  # n_ev x |grid|
-    # test (all rows)
-    surv_test   <- surv_model$predict(data_test, t_grid)$predictions                           # n_test x |grid|
-
-    # ----- build score matrices for all λ via interpolation -----
-    # cal events: per-row vector xout = pmax(0, time_ev + λ)
-    t_out_cal <- outer(time_ev, lambda_grid, function(t, l) pmax(0, t + l))  # n_ev x G
-    scores_cal_mat <- matrix(NA_real_, nrow = length(idx_ev_cal), ncol = G)
-    for (i in seq_len(nrow(surv_cal_ev))) {
-        scores_cal_mat[i, ] <- stats::approx(t_grid, surv_cal_ev[i, ], xout = t_out_cal[i, ], rule = 2)$y
-    }
-    # gate by screening_time (as in your code)
-    scores_cal_mat <- apply(scores_cal_mat, 2, .gate_cal, time_ev = time_ev,
-                            t_screen = screening_time, crit = screening_crit)
-
-    # test: same xout for every row (screening_time + λ)
-    t_out_test <- pmax(0, screening_time + lambda_grid)  # length G
-    # vectorized per-row interpolation
-    scores_test_mat <- matrix(NA_real_, nrow = n_test, ncol = G)
-    for (i in seq_len(nrow(surv_test))) {
-      scores_test_mat[i, ] <- stats::approx(t_grid, surv_test[i, ], xout = t_out_test, rule = 2)$y
-    }
-
-    # ----- compute conformal stats for all λ (no extra predicts) -----
-    alpha <- if (screening_crit == "low risk") (1 - screening_prob) else screening_prob
-    den   <- 1 + n_cal
-
-    stats_rep <- numeric(G)
-    for (g in seq_len(G)) {
-      s_cal  <- scores_cal_mat[, g]            # length n_ev
-      s_test <- scores_test_mat[, g]           # length n_test
-
-      # outer compare (n_ev x n_test) → TRUE if cal >= test
-      comp <- outer(s_cal, s_test, FUN = ">=")
-      # numerator per test obs: 1 + Σ w_cal_ev * 1{ s_cal >= s_test_j }
-      num  <- 1 + as.numeric(t(comp) %*% w_cal_ev)  # length n_test
-      pval <- pmin(1, num / den)
-
-      if (criterion == "bh") {
-        stats_rep[g] <- sum(stats::p.adjust(pval, method = "BH") <= alpha)
-      } else { # fisher
-        pv <- pval[is.finite(pval) & pval > 0]
-        stats_rep[g] <- if (length(pv)) -2 * sum(log(pv)) else 0
-      }
-    }
-
-    r_stats[[rep]] <- data.frame(rep = rep, lambda = lambda_grid, stat = stats_rep, row.names = NULL)
-  }
-
-  per_repeat <- do.call(rbind, r_stats)
-  # summarize across repeats
-  agg <- aggregate(stat ~ lambda, data = per_repeat,
-                   FUN = function(z) c(mean = mean(z), sd = stats::sd(z)))
-  summary <- data.frame(
-    lambda    = agg$lambda,
-    mean_stat = agg$stat[,1],
-    sd_stat   = agg$stat[,2],
-    n         = n_repeats,
-    row.names = NULL
-  )
-  #best_lambda <- summary$lambda[which.max(summary$mean_stat)]
-  best_lambda <- select_lambda_1se(summary, direction = "maximize")$lambda_1se
-
-  list(
-    lambda_opt = best_lambda,
-    summary    = summary,
-    per_repeat = per_repeat
-  )
+## ---------------------------------------------------------
+## Survival curves evaluated at times.
+## If `curves` (on `t_grid`) is supplied the values are interpolated rather
+## than re-predicted -- the gamma tuner sweeps many time shifts and must
+## not re-call the model for each one.
+## `times` is either one common vector, or one time per row (row_times).
+## ---------------------------------------------------------
+## Linear interpolation of every row of `curves` (given on `t_grid`),
+## vectorised.  Equivalent to approx(..., rule = 2) applied row by row, but
+## without the per-row call: the tuner would otherwise make O(n |Gamma| R)
+## calls to approx(), which dominated its running time.
+.interp_common <- function(curves, t_grid, x) {          # one common time vector
+    x <- pmin(pmax(x, t_grid[1L]), t_grid[length(t_grid)])          # rule = 2
+    j <- findInterval(x, t_grid, all.inside = TRUE)
+    w <- (x - t_grid[j]) / (t_grid[j + 1L] - t_grid[j])
+    W <- matrix(w, nrow(curves), length(x), byrow = TRUE)
+    curves[, j, drop = FALSE] * (1 - W) + curves[, j + 1L, drop = FALSE] * W
 }
 
-## Select λ by the 1-SE rule (glmnet-style)
-## - direction="maximize" (your case): pick largest λ with mean >= max_mean - SE_at_max
-## - direction="minimize"             : pick largest λ with mean <= min_mean + SE_at_min
+.interp_rowwise <- function(curves, t_grid, x) {         # one time per row
+    x <- pmin(pmax(x, t_grid[1L]), t_grid[length(t_grid)])
+    j <- findInterval(x, t_grid, all.inside = TRUE)
+    w <- (x - t_grid[j]) / (t_grid[j + 1L] - t_grid[j])
+    rows <- seq_len(nrow(curves))
+    curves[cbind(rows, j)] * (1 - w) + curves[cbind(rows, j + 1L)] * w
+}
+
+.eval_curves <- function(data, surv_model, times, curves = NULL, t_grid = NULL, eps = 1e-12) {
+    times <- pmax(0, as.numeric(times))
+    S <- if (is.null(curves)) {
+        matrix(as.numeric(surv_model$predict(data, times)$predictions), nrow = nrow(data))
+    } else {
+        .interp_common(curves, t_grid, times)
+    }
+    pmin(pmax(S, eps), 1)
+}
+
+.eval_curves_rowwise <- function(data, surv_model, row_times, curves = NULL, t_grid = NULL,
+                                 eps = 1e-12) {
+    row_times <- pmax(0, as.numeric(row_times))
+    S <- if (is.null(curves)) {
+        compute_scores_from_model(data, surv_model, times = row_times, score_type = "survival")
+    } else {
+        .interp_rowwise(curves, t_grid, row_times)
+    }
+    pmin(pmax(as.numeric(S), eps), 1)
+}
+
+## Shifted curves Shat(u_k + gamma | X_i) on the grid, monotonised so that
+## the horizon search below is a binary search.
+.shifted_curves <- function(data, surv_model, u, gamma = 0, curves = NULL, t_grid = NULL) {
+    .row_apply(.eval_curves(data, surv_model, u + gamma, curves, t_grid), cummin)
+}
+
+## ---------------------------------------------------------
+## b_z(X_i) of (23), as a 0-based grid index: the largest u_k with
+## Shat(u_k + gamma | X_i) >= z, or -1 when no such point exists.
+## Returns an n x length(z) integer matrix.
+## ---------------------------------------------------------
+.horizon_index <- function(Sshift, z, K) {
+    z <- as.numeric(z)
+    idx <- matrix(NA_integer_, nrow = nrow(Sshift), ncol = length(z))
+    for (i in seq_len(nrow(Sshift))) {
+        ## count of grid values strictly below z; rev() makes it non-decreasing
+        idx[i, ] <- K - findInterval(z, rev(Sshift[i, ]), left.open = TRUE)
+    }
+    idx
+}
+
+## ---------------------------------------------------------
+## Everything the p-value computation needs from the survival model at a
+## given time shift.  WHICH pieces are needed depends on the pseudo-outcome,
+## and this is the only place that distinction appears:
+##
+##   Psi^et is an INDICATOR in the horizon,
+##       Psi_i(b_z(X_i)) = w_i I(T_i <= b_z(X_i)) = w_i I(z_cal_i >= z),
+##   so each calibration subject is summarised by the single number
+##       z_cal_i = Shat(T_i + gamma | X_i),  gated to -Inf when T_i > t0,
+##   and no grid is involved at all.
+##
+##   Psi_dr instead has to be evaluated AT the horizon b_z(X_i), because
+##   Qhat and the prefix sums depend on where it falls, so the whole shifted
+##   curve is required.
+##
+## Both routes compute the same Hhat; test 7f checks they agree exactly.
+## Using the indicator route where it applies is what keeps the gamma tuner
+## affordable: O(n log n + m log n) per candidate instead of O(n(K + m)).
+## ---------------------------------------------------------
+conformal_inputs <- function(po, data.cal, data.test, surv_model, gamma = 0,
+                             curves.cal = NULL, curves.test = NULL, t_grid = NULL,
+                             force_horizons = FALSE) {
+    z_test <- as.numeric(.eval_curves(data.test, surv_model, po$t0 + gamma,
+                                      curves.test, t_grid))
+    indicator <- (po$flavor == "et") && !force_horizons
+
+    if (indicator) {
+        z_cal <- .eval_curves_rowwise(data.cal, surv_model, po$time + gamma,
+                                      curves.cal, t_grid)
+        z_cal[po$time > po$t0] <- -Inf          # R(x,t) = 0 beyond the horizon
+        list(z_cal = z_cal, z_test = z_test, Sshift = NULL)
+    } else {
+        list(z_cal = NULL, z_test = z_test,
+             Sshift = .shifted_curves(data.cal, surv_model, po$u, gamma,
+                                      curves.cal, t_grid))
+    }
+}
+
+## Restrict the model-side inputs to a calibration / test split.  Both
+## z_cal and Sshift are row-wise in the calibration subject, and z_test is
+## row-wise in the cohort subject, so for a fixed gamma the inputs can be
+## built once on a whole pool and then subset.
+.subset_conformal_inputs <- function(inp, idx_cal, idx_test) {
+    list(z_cal  = if (is.null(inp$z_cal))  NULL else inp$z_cal[idx_cal],
+         z_test = inp$z_test[idx_test],
+         Sshift = if (is.null(inp$Sshift)) NULL else inp$Sshift[idx_cal, , drop = FALSE])
+}
+
+## ---------------------------------------------------------
+## Conformal p-values for a cohort.  Flavor-agnostic: swap po$flavor to
+## switch between (19) and (24).
+## ---------------------------------------------------------
+conformal_pvalues <- function(po, inp) {
+    n <- po$n
+    z_test <- inp$z_test
+    m <- length(z_test)
+    if (!isTRUE(po$varying_horizon)) {
+        stop("conformal screening needs pseudo-outcomes valid at varying horizons ",
+             "(flavor 'et' or 'dr'); got '", po$flavor, "'.")
+    }
+   
+    Hhat <- if (is.null(inp$Sshift)) {
+        ## Indicator route: accumulate the weighted right tail by sorting.
+        ord  <- order(inp$z_cal, decreasing = TRUE)
+        cumw <- cumsum(po$w_event[ord])
+        k    <- n - findInterval(z_test, sort(inp$z_cal), left.open = TRUE)  # #{z_cal >= z}
+        ifelse(k > 0, cumw[pmax(k, 1L)], 0) / n
+    } else {
+        ## General route: evaluate Psi at the horizon b_z(X_i).  Done in
+        ## column blocks -- one vectorised pass each, with the block width
+        ## chosen so the temporaries stay near 1e6 entries.
+        ELL <- .horizon_index(inp$Sshift, z_test, po$K)
+        H <- numeric(m)
+        width <- max(1L, min(m, floor(1e6 / max(n, 1))))
+        for (start in seq(1L, m, by = width)) {
+            j <- start:min(m, start + width - 1L)
+            H[j] <- colMeans(pseudo_psi(po, ELL[, j, drop = FALSE]))
+        }
+        H
+    }
+
+    p <- (1 + n * Hhat) / (1 + n)
+    ## Pi of (24): sup over z' >= z, then clip to [0,1].  The lower clip is
+    ## not part of Pi but is needed because Hhat can be negative under
+    ## augmentation; it preserves monotonicity and only enlarges p-values.
+    ord <- order(z_test, decreasing = TRUE)
+    g <- rep(NA_real_, m)
+    g[ord] <- cummax(p[ord])
+    list(p.values = pmin(1, pmax(0, g)), H.hat = Hhat)
+}
+
+## ---------------------------------------------------------
+## screening_conformal()
+##
+##   po           : pseudo-outcome object built on data.cal with GRID
+##                  ENDPOINT t0.  t0 is the end of the time grid, not the
+##                  horizon at which Psi is evaluated: this routine
+##                  evaluates Psi at the covariate-dependent horizons
+##                  b_z(X_i) of (23), which vary with both the calibration
+##                  subject and the candidate threshold z (typically a few
+##                  hundred distinct horizons per cohort).  A single object
+##                  suffices because R(x,t) = Shat(t+gamma|x) I[t <= t0] is
+##                  zero beyond t0, so b_z(X) <= t0 always, and the object
+##                  carries Ghat, Shat and the prefix sums across the whole
+##                  grid [0, t0].
+##                  flavor "et" -> eq. (19); flavor "dr" -> eq. (24).
+##   gamma        : time shift of (17).  If NULL and tuning data are
+##                  supplied it is tuned by .conformal_autotune().
+##   p.sel.accept : nu of Section 4.5; abstain below it
+##
+## Only low-risk screening is supported.  For high-risk screening the
+## score is non-DEcreasing in t and the relevant horizons live in
+## [t0, Inf), so both the grid and the equivalence in (23) would have to
+## be rebuilt; the function stops rather than returning something wrong.
+## ---------------------------------------------------------
+screening_conformal <- function(data.test, data.cal, po, surv_model,
+                                screening_time, screening_prob,
+                                screening_crit = "low risk",
+                                gamma = NULL,
+                                data.tune = NULL, weights.tune = NULL, cens_model = NULL,
+                                p.sel.accept = 0.9, n.boot = 1000L) {
+
+    if (screening_crit != "low risk") {
+        stop("screening_conformal() supports screening_crit = 'low risk' only; ",
+             "see the note in this file for why the high-risk case needs a different grid.")
+    }
+    stopifnot(nrow(data.cal) == po$n)
+    ## the horizon comes from the pseudo-outcome object, so a mismatched
+    ## screening_time would otherwise be silently ignored
+    stopifnot(isTRUE(all.equal(as.numeric(screening_time), as.numeric(po$t0))))
+    alpha <- 1 - screening_prob
+
+    if (is.null(gamma)) {
+        gamma <- if (!is.null(data.tune) && !is.null(weights.tune)) {
+            .conformal_autotune(data.tune, weights.tune, surv_model, cens_model,
+                                screening_time, screening_prob)$gamma_opt
+        } else 0
+    }
+
+    inp <- conformal_inputs(po, data.cal, data.test, surv_model, gamma = gamma)
+    res <- conformal_pvalues(po, inp)
+    pvals <- res$p.values
+    browser()
+
+    pvals.adj <- p.adjust(pvals, method = "BH")
+    sel <- which(pvals.adj <= alpha)
+
+    ## Abstention (Section 4.5): bootstrap P(|S| > 0 | Dcal).  phat is a
+    ## fixed function of Dcal, so resampling cohort rows is the same as
+    ## resampling their p-values.
+    p.sel.boot <- mean(vapply(seq_len(n.boot), function(b)
+        any(p.adjust(sample(pvals, replace = TRUE), method = "BH") <= alpha), logical(1)))
+    sel.stable <- if (p.sel.boot < p.sel.accept) integer(0) else sel
+
+    list(selections = sel, selections.stable = sel.stable,
+         p.values = pvals, p.values.adj = pvals.adj, H.hat = res$H.hat,
+         gamma = gamma, p.sel.boot = p.sel.boot)
+}
+
+## ---------------------------------------------------------
+## Cross-validation for the time shift gamma (Algorithm S5).
+##
+## Uses the same conformal_pvalues() core as the main routine.  Since the
+## models are fixed, NOTHING here needs rebuilding per split: the
+## pseudo-outcomes and the fitted curves are computed once for the whole
+## tuning set, the model-side inputs once per gamma, and each repeat is a
+## pure subsetting operation.
+##
+## The `flavor` argument selects which p-values gamma is tuned for; it
+## should match the flavor the method will actually run with, since gamma is
+## a power heuristic.  The guarantees hold conditionally on gamma however it
+## was chosen, provided the tuning data are independent of Dcal.
+## ---------------------------------------------------------
+.conformal_autotune <- function(data.tune, weights.tune, surv_model, cens_model = NULL,
+                                screening_time, screening_prob,
+                                gamma_grid = NULL, n_repeats = 5,
+                                criterion = c("fisher","bh"), flavor = "et",
+                                max_cal = 1000L, max_test = 250L,
+                                tune_grid = 100L, grid_size = 400,
+                                seed = NULL, one_se = FALSE) {
+    criterion <- match.arg(criterion)
+    if (!is.null(seed)) set.seed(seed)
+    alpha <- 1 - screening_prob
+    N <- nrow(data.tune)
+
+    if (is.null(gamma_grid)) {
+        gamma_grid <- unique(c(0, as.numeric(stats::quantile(data.tune$time,
+                                                             seq(0.5, 0.95, length.out = 50),
+                                                             na.rm = TRUE))))
+    }
+    G <- length(gamma_grid)
+
+    ## The models are fixed, so Psi_i depends only on subject i: build the
+    ## pseudo-outcomes ONCE for the whole tuning set, and let each repeat
+    ## subset them.  A coarse grid is enough here -- this chooses one scalar.
+    po_full <- build_pseudo_outcomes(data.tune, cens_model, data.tune$time, data.tune$status,
+                                     screening_time, flavor = flavor,
+                                     surv_model = surv_model,
+                                     weights_event = weights.tune,
+                                     num_grid = tune_grid, max_grid = tune_grid)
+
+    ## ... and one prediction pass for the whole tuning set; every gamma is
+    ## then an interpolation.
+    t_max <- max(data.tune$time, screening_time, na.rm = TRUE) + max(gamma_grid, 0)
+    t_grid <- seq(0, t_max, length.out = grid_size)
+    curves <- matrix(as.numeric(surv_model$predict(data.tune, t_grid)$predictions), nrow = N)
+
+    ## Splits are drawn once and reused across gamma, so the candidates are
+    ## compared on exactly the same partitions.
+    n_ca <- min(max_cal, floor(N/2))
+    splits <- lapply(seq_len(n_repeats), function(r) {
+        idx <- sample.int(N)
+        list(ca = idx[seq_len(n_ca)],
+             te = idx[n_ca + seq_len(min(max_test, N - n_ca))])
+    })
+
+    stats_mat <- matrix(NA_real_, nrow = n_repeats, ncol = G)
+
+    for (g in seq_len(G)) {
+        ## z_cal and z_test are row-wise in the subject, so they too are
+        ## computed once per gamma rather than once per (gamma, repeat).
+        inp_full <- conformal_inputs(po_full, data.tune, data.tune, surv_model,
+                                     gamma = gamma_grid[g],
+                                     curves.cal = curves, curves.test = curves,
+                                     t_grid = t_grid)
+
+        for (r in seq_len(n_repeats)) {
+            ca <- splits[[r]]$ca
+            te <- splits[[r]]$te
+            if (!length(te) || !any(po_full$status[ca] == 1L)) next
+
+            pv <- conformal_pvalues(subset_pseudo_outcomes(po_full, ca),
+                                    .subset_conformal_inputs(inp_full, ca, te))$p.values
+
+            stats_mat[r, g] <- if (criterion == "bh") {
+                sum(p.adjust(pv, method = "BH") <= alpha)
+            } else {
+                pvp <- pv[is.finite(pv) & pv > 0]
+                if (length(pvp)) -2 * sum(log(pvp)) else 0
+            }
+        }
+    }
+
+    mean_stat <- colMeans(stats_mat, na.rm = TRUE)
+    sd_stat   <- apply(stats_mat, 2, stats::sd, na.rm = TRUE)
+    summary <- data.frame(gamma = gamma_grid, mean_stat = mean_stat,
+                          sd_stat = sd_stat, n = n_repeats)
+
+    ## Algorithm S5 selects the plain argmax (ties -> smallest gamma).
+    ## one_se = TRUE gives the more conservative 1-SE variant instead.
+    gamma_opt <- if (one_se) {
+        select_lambda_1se(summary, lambda_col = "gamma", direction = "maximize")$lambda_1se
+    } else {
+        cand <- which(mean_stat == max(mean_stat, na.rm = TRUE))
+        gamma_grid[min(cand)]
+    }
+
+    list(gamma_opt = gamma_opt, summary = summary)
+}
+
+## Select by the 1-SE rule (glmnet-style); kept for the optional variant above.
 select_lambda_1se <- function(df,
                               lambda_col = "lambda",
                               mean_col   = "mean_stat",
@@ -251,31 +367,17 @@ select_lambda_1se <- function(df,
     direction <- match.arg(direction)
     x <- df[complete.cases(df[, c(lambda_col, mean_col, sd_col, n_col)]), ]
     if (nrow(x) == 0) stop("No complete rows.")
-
-    ## Standard error at each λ
     se <- if (already_se) x[[sd_col]] else x[[sd_col]] / sqrt(x[[n_col]])
     se[!is.finite(se)] <- NA_real_
-
     if (direction == "maximize") {
-        i_best <- which.max(x[[mean_col]])
-        thr <- x[[mean_col]][i_best] - se[i_best]
+        i_best <- which.max(x[[mean_col]]); thr <- x[[mean_col]][i_best] - se[i_best]
         idx <- which(x[[mean_col]] >= thr)
     } else {
-        i_best <- which.min(x[[mean_col]])
-        thr <- x[[mean_col]][i_best] + se[i_best]
+        i_best <- which.min(x[[mean_col]]); thr <- x[[mean_col]][i_best] + se[i_best]
         idx <- which(x[[mean_col]] <= thr)
     }
-
-    ## Among candidates within 1-SE, choose the largest λ
     j <- idx[which.max(x[[lambda_col]][idx])]
-    res <- list(
-        lambda_1se = x[[lambda_col]][j],
-        index_1se  = j,
-        lambda_best = x[[lambda_col]][i_best],
-        index_best  = i_best,
-        threshold   = thr,
-        mean_best   = x[[mean_col]][i_best],
-        se_at_best  = se[i_best]
-    )
-    return(res)
+    list(lambda_1se = x[[lambda_col]][j], index_1se = j,
+         lambda_best = x[[lambda_col]][i_best], index_best = i_best,
+         threshold = thr, mean_best = x[[mean_col]][i_best], se_at_best = se[i_best])
 }

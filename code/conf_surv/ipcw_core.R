@@ -1,8 +1,19 @@
 ## ============================================================
-## Calibration for conditional risk upon selection (model-agnostic)
-##   - score = survival probability at t0 (higher = safer)
-##   - HT denominators (unweighted E[A])
-##   - IPCW(1) = "et" (PPV-style), IPCW(2) = "ft" (NPV-style)
+## Calibration for the conditional risk upon selection.
+##
+## Flavor-agnostic: everything here operates on a pseudo-outcome object
+## (see pseudo_outcomes.R) and is identical for IPCW and AIPCW.  The
+## estimator is always the ratio
+##
+##   rhat(lambda) = mean_i A_lambda(X_i) Psi_i / mean_i A_lambda(X_i),
+##
+## with influence contribution (13)
+##
+##   psi_i(lambda) = A_lambda(X_i) {Psi_i - rhat(lambda)} / muhat(lambda),
+##
+## which is what the delta-method bound and the multiplier band consume.
+##
+## Depends on: pseudo_outcomes.R.
 ## ============================================================
 
 ## ---------- Utilities ----------
@@ -29,82 +40,46 @@ binom_upper_bound <- function(k, n, delta) {
 estimate_M <- function(Z) {
     Zf <- Z[is.finite(Z)]
     if (!length(Zf)) return(1)
-    pmax(1,max(Zf))
+    pmax(1, max(Zf))
 }
 
-## ---------- Core per-λ estimator (HT) and influence function ----------
-.core_ipcw_risk <- function(A, time, status, t0,
-                            ipcw_method = c("ft","et"),
-                            weights_event = NULL, weights_fixed = NULL) {
-    ipcw_method <- match.arg(ipcw_method)
+## ---------- Core per-lambda estimator and influence function ----------
+## The ONLY input that depends on the flavor is Psi.
+.core_pseudo_risk <- function(A, Psi) {
     n <- length(A)
     A <- as.integer(A)
-    if (sum(A) == 0) return(list(risk_hat = NA_real_, mu_bar = 0, phi = rep(0, n)))
-
-    if (ipcw_method == "et") {
-        stopifnot(!is.null(weights_event))
-        E <- .event_by_t0(time, status, t0)
-        w <- weights_event
-        w[is.na(w) | E == 0] <- 0                  # non-events contribute 0
-        X <- A * w                                  # = A * w * E
-        Y <- A
-        theta_bar <- mean(X);  mu_bar <- mean(Y)
-        risk_hat  <- if (mu_bar > 0) theta_bar / mu_bar else NA_real_
-        Xc <- X - theta_bar; Yc <- Y - mu_bar
-        phi <- (Xc / mu_bar) - (theta_bar / (mu_bar^2)) * Yc          # IF for θ/μ
-
-    } else { # ft (NPV-style)
-        stopifnot(!is.null(weights_fixed))
-        R <- .at_risk_t0(time, t0)
-        X <- A * weights_fixed * R
-        Y <- A
-        theta_bar <- mean(X);  mu_bar <- mean(Y)
-        S_hat <- if (mu_bar > 0) theta_bar / mu_bar else NA_real_
-        risk_hat <- if (!is.na(S_hat)) 1 - S_hat else NA_real_
-        Xc <- X - theta_bar; Yc <- Y - mu_bar
-        phi <- - (Xc / mu_bar - (theta_bar / (mu_bar^2)) * Yc)        # IF for 1 - θ/μ
-    }
-
-    risk_hat[is.na(risk_hat)] <- 1
+    mu_bar <- mean(A)
+    if (mu_bar <= 0) return(list(risk_hat = NA_real_, mu_bar = 0, phi = rep(0, n)))
+    theta_bar <- mean(A * Psi)
+    risk_hat  <- theta_bar / mu_bar
+    ## (13); note that non-selected subjects contribute exactly 0
+    phi <- A * (Psi - risk_hat) / mu_bar
     list(risk_hat = risk_hat, mu_bar = mu_bar, phi = phi)
 }
 
 ## ---------- Pointwise bounds ----------
-## Always compute: delta-method one-sided UB
+## Delta-method one-sided UB
 pointwise_delta_ub <- function(risk_hat_vec, Phi_mat, delta) {
     n <- nrow(Phi_mat)
     se <- sqrt(pmax(apply(Phi_mat, 2, stats::var), 0) / n)
     z  <- stats::qnorm(1 - delta)
     ub <- pmin(1, risk_hat_vec + z * se)
     ub[is.na(ub)] <- 1
-    return(ub)
+    ub
 }
 
-## Optional: subject-level nonparametric bootstrap (slow; conditions on provided weights)
-pointwise_bootstrap_ub <- function(scores, time, status, t0, screening_crit,
-                                   ipcw_method, weights_event, weights_fixed,
-                                   lambda_seq, delta, B_boot = 1000L) {
-    n <- length(scores); K <- length(lambda_seq)
+## Nonparametric bootstrap, Algorithm S1: resamples the pairs
+## {(X_i, Psi_i)}, so it is flavor-agnostic by construction.  The models
+## are NOT refitted inside the loop, matching the conditional perspective.
+pointwise_bootstrap_ub <- function(Amat, Psi, delta, B_boot = 1000L) {
+    n <- nrow(Amat); K <- ncol(Amat)
     boots <- matrix(NA_real_, nrow = B_boot, ncol = K)
     for (b in seq_len(B_boot)) {
         idx <- sample.int(n, n, replace = TRUE)
-        scores_b <- scores[idx]; time_b <- time[idx]; status_b <- status[idx]
-        A_b <- sapply(lambda_seq, function(l) .select_by_score(scores_b, l, screening_crit))
-        if (ipcw_method == "et") {
-            if (is.null(weights_event)) stop("weights_event required for event_time method.")
-            w_evt_b <- weights_event[idx]
-            for (k in seq_len(K)) {
-                estb <- .core_ipcw_risk(A_b[,k], time_b, status_b, t0, "et", weights_event = w_evt_b)
-                boots[b, k] <- estb$risk_hat
-            }
-        } else {
-            if (is.null(weights_fixed)) stop("weights_fixed required for fixed_time method.")
-            w_fix_b <- weights_fixed[idx]
-            for (k in seq_len(K)) {
-                estb <- .core_ipcw_risk(A_b[,k], time_b, status_b, t0, "ft", weights_fixed = w_fix_b)
-                boots[b, k] <- estb$risk_hat
-            }
-        }
+        Ab  <- Amat[idx, , drop = FALSE]
+        num <- colMeans(Ab * Psi[idx])
+        den <- colMeans(Ab)
+        boots[b, ] <- ifelse(den > 0, num / den, NA_real_)
     }
     apply(boots, 2, function(x) {
         q <- stats::quantile(x, probs = 1 - delta, na.rm = TRUE, names = FALSE)
@@ -112,194 +87,230 @@ pointwise_bootstrap_ub <- function(scores, time, status, t0, screening_crit,
     })
 }
 
-## Optional: finite-sample (empirical-Bernstein or Hoeffding) UB
-estimate_risk_ipcw_fs <- function(selections, time, status, t0,
-                                  ipcw_method = c("et","ft"),
-                                  weights_event = NULL, weights_fixed = NULL,
-                                  delta = 0.05, M = NULL,
-                                  method = c("empirical_bernstein","hoeffding")) {
-    ipcw_method <- match.arg(ipcw_method)
+## Finite-sample UB: empirical Bernstein for the numerator + exact
+## binomial lower bound for the denominator (Supplement S1.1.4).
+##
+## This always uses the IPCW-ET pseudo-outcome, as specified in
+## Supplement S1.1.2, because Psi_dr is not bounded in [0, M].
+estimate_risk_fs <- function(A, po, delta = 0.05, M = NULL,
+                             method = c("empirical_bernstein","hoeffding")) {
     method <- match.arg(method)
-    n <- length(selections)
-    A <- as.integer(selections)
+    n <- length(A); A <- as.integer(A)
     if (sum(A) == 0) return(1)
 
-    if (ipcw_method == "et") {
-        if (is.null(weights_event)) stop("weights_event required for event_time.")
-        E <- .event_by_t0(time, status, t0)
-        w <- weights_event
-        w[is.na(w) | E == 0] <- 0
-        Z <- w * A                           # = w * A * E ∈ [0, M]
-    } else {
-        if (is.null(weights_fixed)) stop("weights_fixed required for fixed_time.")
-        R <- .at_risk_t0(time, t0)
-        w <- weights_fixed
-        w[!is.finite(w) | R == 0] <- 0
-        Z <- w * A * R                       # ∈ [0, M]
-    }
-
+    Z <- po$w_event * (po$time <= po$t0) * A     # in [0, M]
     theta_hat <- mean(Z)
     var_Z <- stats::var(Z)
-    m <- sum(A)
-    mu_low <- binom_lower_bound(m, n, delta/4)
+    mu_low <- binom_lower_bound(sum(A), n, delta/2)
     if (mu_low <= 0) return(1)
-
     if (is.null(M)) M <- estimate_M(Z)
 
-    if (method == "empirical_bernstein") {
-        phi_upp <- theta_hat + sqrt(2 * var_Z * log(4/delta) / n) + (7 * M * log(4/delta)) / (3 * max(1, n - 1))
-    } else { # Hoeffding
-        phi_upp <- theta_hat + M * sqrt(log(4/delta) / (2 * n))
+    phi_upp <- if (method == "empirical_bernstein") {
+        theta_hat + sqrt(2 * var_Z * log(4/delta) / n) + (7 * M * log(4/delta)) / (3 * max(1, n - 1))
+    } else {
+        theta_hat + M * sqrt(log(2/delta) / (2 * n))
     }
     ub <- min(1, phi_upp / mu_low)
     if (!is.finite(ub)) ub <- 1
-    ub[is.na(ub)] <- 1
     ub
 }
 
+
+## ---------- Studentization factors ----------
+## Upper confidence bound for the standard deviation of the influence
+## contributions at each lambda.  Studentizing by sigma_hat itself is
+## unstable: sigma_hat(lambda) can be arbitrarily small, or exactly zero
+## (one selected subject, or all selected subjects censored before t0
+## under IPCW), which would let a handful of noisy thresholds dictate the
+## critical value.  Using an upper bound floors the denominator.
+##
+## The degrees of freedom are n_eff(lambda), the number of SELECTED
+## subjects, not n: phi_i = 0 for every non-selected subject, so
+## colMeans(Phi^2) is an average of n_eff nonzero terms over n.  Using
+## df = n would give a flat ~4% inflation at every threshold and no
+## protection where it is needed -- and an under-estimated sd(lambda)
+## narrows the band at exactly the threshold that gets selected.
+.sd_upper_bound <- function(Phi, n_eff, gamma = 0.05) {
+    s2 <- colMeans(Phi^2)
+    sqrt(pmax(nrow(Phi) * s2 / stats::qchisq(gamma, df = pmax(n_eff - 1, 1)), 0))
+}
+
 ## ---------- Simultaneous (uniform) band ----------
-.multiplier_halfwidth <- function(Phi, delta = 0.05, center = TRUE, B = NULL) {
+## Studentized Gaussian multiplier band (Supplement S1.1.6).  Unlike the
+## unstudentized version, the half-width is lambda-specific:
+##
+##   UCB(lambda) = rhat(lambda) + q_{1-delta} * sd(lambda) / sqrt(n),
+##
+## with q_{1-delta} the (1-delta) quantile of max_lambda Z(lambda) and
+## Z(lambda) the multiplier process divided by sd(lambda).  Only an upper
+## bound on r is needed, so the max is one-sided by default.
+##
+## `ok` selects the thresholds the band is built on; the rest are handled
+## by the finite-sample fallback in compute_calibration_table().
+## `ok` selects the thresholds the band is built on; the rest are handled
+## by the vacuous value 1 in compute_calibration_table().  `n_eff` is the
+## number of SELECTED subjects at each threshold: phi_i is exactly zero
+## for non-selected subjects, so sigma_hat(lambda) is estimated from
+## n_eff(lambda) nonzero terms, not from n.
+.multiplier_halfwidth <- function(Phi, ok = NULL, n_eff = NULL, delta = 0.05,
+                                  center = TRUE, B = NULL, one_sided = TRUE,
+                                  sd_gamma = 0.05) {
     n <- nrow(Phi); K <- ncol(Phi)
-    if (K == 0) return(list(hw = NA_real_, crit = NA_real_))
-    if (is.null(B)) B <- max(1000L, ceiling(200 * log(K + 10)))
-    xi <- matrix(rnorm(n * B), nrow = n, ncol = B)
+    hw <- rep(NA_real_, K); sd_ub <- rep(NA_real_, K)
+    if (is.null(ok))    ok <- rep(TRUE, K)
+    if (is.null(n_eff)) n_eff <- rep(n, K)
+    if (K == 0 || !any(ok)) return(list(hw = hw, crit = NA_real_, sd = sd_ub))
+
+    Phi_ok    <- Phi[, ok, drop = FALSE]
+    sd_ub[ok] <- .sd_upper_bound(Phi_ok, n_eff = n_eff[ok], gamma = sd_gamma)
+    K_ok      <- sum(ok)
+    if (is.null(B)) B <- max(1000L, ceiling(200 * log(K_ok + 10)))
+
+    xi <- matrix(stats::rnorm(n * B), nrow = n, ncol = B)
     if (center) xi <- sweep(xi, 2, colMeans(xi), "-")
-    Z <- t(xi) %*% Phi / sqrt(n)              # B x K
-    Tstat <- apply(abs(Z), 1, max)            # sup over λ
-    q <- as.numeric(stats::quantile(Tstat, probs = 1 - delta, names = FALSE))
-    list(hw = q / sqrt(n), crit = q)
+    Z <- t(xi) %*% Phi_ok / sqrt(n)                 # B x K_ok
+    Z <- sweep(Z, 2, sd_ub[ok], FUN = "/")          # studentize
+
+    Tstat <- if (one_sided) apply(Z, 1, max) else apply(abs(Z), 1, max)
+    q     <- as.numeric(stats::quantile(Tstat, probs = 1 - delta, names = FALSE))
+
+    hw[ok] <- q * sd_ub[ok] / sqrt(n)
+    list(hw = hw, crit = q, sd = sd_ub)
 }
 
 ## ---------- Binomial CP (conservative) upper bound ----------
-## Treat censored-before-t0 as failures; fully observed 0/1 within A.
+## Treats censored-before-t0 as failures; does not use pseudo-outcomes.
 cp_conservative_ub <- function(A, time, status, t0, delta) {
-  A <- as.integer(A)
-  m <- sum(A)
-  if (m == 0) return(1)
-  # error* within A: 1 if (event by t0) OR (censored before t0)
-  err_star <- as.integer( (status == 1 & time <= t0) | (status == 0 & time < t0) )
-  k <- sum(A * err_star)
-  # one-sided CP upper bound for p = P(error | A=1)
-  if (k >= m) 1 else stats::qbeta(1 - delta, k + 1, m - k)
+    A <- as.integer(A)
+    m <- sum(A)
+    if (m == 0) return(1)
+    err_star <- as.integer((status == 1 & time <= t0) | (status == 0 & time < t0))
+    k <- sum(A * err_star)
+    if (k >= m) 1 else stats::qbeta(1 - delta, k + 1, m - k)
+}
+
+## Diagnostic only: number of SELECTED subjects with an OBSERVED event
+## before t0.  Reported in the calibration table but NOT used to gate
+## anything: at a short horizon a genuinely low-risk subgroup has no
+## events, and zero events out of many selected is strong evidence that
+## r <= alpha, not an absence of information.
+.n_eff_events <- function(Amat, po) {
+    ev <- .event_by_t0(po$time, po$status, po$t0)
+    as.integer(crossprod(Amat, ev))
 }
 
 ## ---------- Public API ----------
-## All enabled bounds are included as columns in the returned data.frame
+## compute_calibration_table(scores, po, ...)
+##
+## `po` is a pseudo-outcome object from build_pseudo_outcomes(); switching
+## between IPCW and AIPCW is a change of its `flavor` and nothing else.
+## The returned columns are unchanged, so the selectors in
+## selection_calibration.R work as before.
+##
+## Note: with flavor = "dr", rhat(lambda) need not lie in [0,1] (paper
+## Section 3.1.2).  It is left unclipped; the bounds are clipped at 1.
 compute_calibration_table <- function(
-                                      scores, time, status, t0,
+                                      scores, po,
                                       screening_crit = c("low risk","high risk"),
-                                      ipcw_method    = c("ft","et"),
-                                      weights_event  = NULL,
-                                      weights_fixed  = NULL,
                                       lambda_seq     = NULL,
                                       num_lambda = 100,
                                       delta = 0.05,
                                       include_uniform = TRUE,
                                       include_bootstrap = FALSE, B_boot = 1000L,
                                       include_cp_conservative = FALSE,
-                                      M = NULL, min_n_asymptotics = 20
+                                      M = NULL, min_n_sel = 10,
+                                      uniform_one_sided = TRUE,
+                                      uniform_sd_gamma = 0.05
                                       ) {
     screening_crit <- match.arg(screening_crit)
-    ipcw_method    <- match.arg(ipcw_method)
-    fs_method      <- "empirical_bernstein"
-
     n <- length(scores)
-    stopifnot(length(time)==n, length(status)==n)
+    stopifnot(n == po$n)
 
-    ## λ grid
     if (is.null(lambda_seq)) {
-        lambda_seq <- as.numeric(stats::quantile(scores, probs = seq(0, 1, length.out = num_lambda), na.rm = TRUE))
+        lambda_seq <- as.numeric(stats::quantile(scores, probs = seq(0, 1, length.out = num_lambda),
+                                                 na.rm = TRUE))
         lambda_seq <- unique(lambda_seq)
     }
-
     K <- length(lambda_seq)
-    risk_hat <- numeric(K)
-    mu_bar   <- numeric(K)
-    Phi      <- matrix(0, nrow = n, ncol = K)
 
-    ## Per-λ estimates & IF
+    ## The pseudo-outcomes at the fixed horizon t0 do not depend on lambda,
+    ## so they are computed once (Supplement S1.2).
+    Psi <- pseudo_psi_at_time(po, po$t0)
+
+    risk_hat <- numeric(K); mu_bar <- numeric(K)
+    Phi  <- matrix(0,  nrow = n, ncol = K)
+    Amat <- matrix(0L, nrow = n, ncol = K)
+
     for (k in seq_len(K)) {
         A <- .select_by_score(scores, lambda_seq[k], screening_crit)
-        est <- .core_ipcw_risk(A, time, status, t0, ipcw_method,
-                               weights_event = weights_event, weights_fixed = weights_fixed)
+        est <- .core_pseudo_risk(A, Psi)
         risk_hat[k] <- est$risk_hat
         mu_bar[k]   <- est$mu_bar
-        Phi[,k]     <- est$phi
+        Phi[, k]    <- est$phi
+        Amat[, k]   <- A
     }
     risk_hat[is.na(risk_hat)] <- 1
-    
+    n_sel <- colSums(Amat)
+    n_ev  <- .n_eff_events(Amat, po)
+
     ## Always: pointwise delta UB
     risk_ub_point_delta <- if (K > 0) pointwise_delta_ub(risk_hat, Phi, delta) else numeric(0)
+
+    ## Always: finite-sample UB (used as the small-sample fallback below)
+    risk_ub_point_fs <- vapply(seq_len(K), function(k)
+        estimate_risk_fs(Amat[, k], po, delta = delta, M = M), numeric(1))
 
     ## Optional: pointwise bootstrap UB
     risk_ub_point_boot <- NULL
     if (include_bootstrap && K > 0) {
-        risk_ub_point_boot <- pointwise_bootstrap_ub(
-            scores, time, status, t0, screening_crit,
-            ipcw_method, weights_event, weights_fixed,
-            lambda_seq, delta, B_boot
-        )
+        risk_ub_point_boot <- pointwise_bootstrap_ub(Amat, Psi, delta, B_boot)
     }
 
-    ## Optional: finite-sample UB
-    risk_ub_point_fs <- NULL
-    if (fs_method != "none" && K > 0) {
-        risk_ub_point_fs <- vapply(seq_len(K), function(k) {
-            A_k <- .select_by_score(scores, lambda_seq[k], screening_crit)
-            estimate_risk_ipcw_fs(
-                selections = A_k, time = time, status = status, t0 = t0,
-                ipcw_method = if (ipcw_method=="et") "et" else "ft",
-                weights_event = weights_event, weights_fixed = weights_fixed,
-                delta = delta, M = M, method = if (fs_method=="empirical_bernstein") "empirical_bernstein" else "hoeffding"
-            )
-        }, numeric(1))
-    }
-
-    ## Optional: conservative CP UB (no surrogate needed)
+    ## Optional: conservative CP UB
     risk_ub_cp_conservative <- NULL
     if (include_cp_conservative && K > 0) {
-        risk_ub_cp_conservative <- vapply(seq_len(K), function(k) {
-            A_k <- .select_by_score(scores, lambda_seq[k], screening_crit)
-            cp_conservative_ub(A_k, time, status, t0, delta)
-        }, numeric(1))
+        risk_ub_cp_conservative <- vapply(seq_len(K), function(k)
+            cp_conservative_ub(Amat[, k], po$time, po$status, po$t0, delta), numeric(1))
     }
 
-    ## Simultaneous (uniform) UB
+    ## Optional: simultaneous band, restricted to thresholds where the
+    ## asymptotics are justified and the influence contributions are non-degenerate.
     risk_ub_uniform <- NULL
+    uniform_crit <- NA_real_
     if (include_uniform && K > 0) {
-        mb <- .multiplier_halfwidth(Phi, delta = delta)
-        risk_ub_uniform <- pmin(1, risk_hat + mb$hw)
-        risk_ub_uniform[is.na(risk_ub_uniform)] <- 1
+        sigma_hat <- sqrt(colMeans(Phi^2))
+        ok_band   <- (n_sel >= min_n_sel) & is.finite(risk_hat) & (sigma_hat > 0)
+        mb <- .multiplier_halfwidth(Phi, ok = ok_band, n_eff = n_sel, delta = delta,
+                                    one_sided = uniform_one_sided,
+                                    sd_gamma = uniform_sd_gamma)
+        risk_ub_uniform <- rep(1, K)
+        risk_ub_uniform[ok_band] <- pmin(1, risk_hat[ok_band] + mb$hw[ok_band])
+        uniform_crit <- mb$crit
     }
-
-    ## Assemble the single calibration table (only columns for methods you used)
+    
     calib <- data.frame(
         lambda        = lambda_seq,
-        n_selected    = as.integer(round(mu_bar * n)),
+        n_selected    = as.integer(n_sel),
+        n_events      = n_ev,
         frac_selected = mu_bar,
         risk_hat      = risk_hat,
         risk_ub_point_delta = risk_ub_point_delta,
+        risk_ub_point_fs    = risk_ub_point_fs,
         stringsAsFactors = FALSE
     )
-    if (!is.null(risk_ub_point_boot))       calib$risk_ub_point_boot <- risk_ub_point_boot
-    if (!is.null(risk_ub_point_fs))         calib$risk_ub_point_fs   <- risk_ub_point_fs
-    if (!is.null(risk_ub_cp_conservative))  calib$risk_ub_cp_conservative  <- risk_ub_cp_conservative
-    if (!is.null(risk_ub_uniform))          calib$risk_ub_uniform    <- risk_ub_uniform
-
-    ## Pick which UB column you actually use downstream
-    for(ub_col in c("risk_ub_point_delta", "risk_ub_point_boot", "risk_ub_uniform")) {
-        if ("risk_ub_point_fs" %in% names(calib)) {
-            fallback <- calib[["risk_ub_point_fs"]]
-        } else {
-            fallback <- rep(1, nrow(calib))
-        }
-        idx <- which(calib$n_selected < min_n_asymptotics)
-        if(length(idx)>0) {
-            if(ub_col %in% names(calib)) {
-                calib[[ub_col]][idx] <- fallback[idx]
-            }
+    if (!is.null(risk_ub_point_boot))      calib$risk_ub_point_boot      <- risk_ub_point_boot
+    if (!is.null(risk_ub_cp_conservative)) calib$risk_ub_cp_conservative <- risk_ub_cp_conservative
+    if (!is.null(risk_ub_uniform))         calib$risk_ub_uniform         <- risk_ub_uniform
+    if (!is.null(risk_ub_uniform)) attr(calib, "uniform_crit") <- uniform_crit
+    
+    ## Fall back to the finite-sample bound where the asymptotics are not
+    ## justified (too few selected subjects).
+    idx <- which(n_sel < min_n_sel)    
+    if (length(idx) > 0) {
+        for (ub_col in c("risk_ub_point_delta", "risk_ub_point_boot")) {
+            if (ub_col %in% names(calib)) calib[[ub_col]][idx] <- calib[["risk_ub_point_fs"]][idx]
         }
     }
-    
-    return(calib)
+
+    calib
 }

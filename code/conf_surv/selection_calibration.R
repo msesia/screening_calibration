@@ -30,128 +30,39 @@ source(file.path(this_dir, "ipcw_core.R"))
 ## -------------------------
 ## Pick the λ with the LARGEST 'size' among indices with risk ≤ alpha (and mask==TRUE).
 ## If 'size' is NULL, tie-break by lambda according to 'tie'.
-select_lambda_greedy <- function(lambda, risk, alpha, size = NULL, mask = NULL,
-                                 tie = c("largest_size_then_largest_lambda",
-                                         "largest_size_then_smallest_lambda",
-                                         "largest_lambda",
-                                         "smallest_lambda")) {
+## Algorithm S2, lines 7-8: among the thresholds whose upper bound meets the
+## target, take the SMALLEST. Yield is non-increasing in lambda, so the
+## smallest feasible threshold is the one that selects the most patients.
+select_lambda_greedy <- function(lambda, risk, alpha) {
     stopifnot(length(lambda) == length(risk))
-    K <- length(lambda)
-    if (!is.null(size)) stopifnot(length(size) == K)
-    if (!is.null(mask)) {
-        stopifnot(length(mask) == K)
-    } else {
-        mask <- rep(TRUE, K)
+    feasible <- which(is.finite(risk) & risk <= .align_alpha(alpha, length(lambda)))
+    if (length(feasible) == 0) {
+        return(list(index = NA_integer_, lambda = NA_real_, feasible = integer(0)))
     }
-    tie <- match.arg(tie)
-    alpha_vec <- .align_alpha(alpha, K)
-
-    eligible <- which(mask & is.finite(risk) & (risk <= alpha_vec))
-    if (length(eligible) == 0) {
-        return(list(index = NA_integer_, lambda = NA_real_, eligible = integer(0)))
-    }
-
-    if (is.null(size)) {
-        ## no size provided → pick by lambda per tie rule
-        pick <- switch(tie,
-                       "largest_lambda"                    = eligible[which.max(lambda[eligible])],
-                       "smallest_lambda"                   = eligible[which.min(lambda[eligible])],
-                       "largest_size_then_largest_lambda"  = eligible[which.max(lambda[eligible])],
-                       "largest_size_then_smallest_lambda" = eligible[which.min(lambda[eligible])]
-                       )
-    } else {
-        df <- data.frame(idx = eligible, size = size[eligible], lambda = lambda[eligible])
-        ord <- switch(tie,
-                      "largest_size_then_largest_lambda"  = order(-df$size, -df$lambda),
-                      "largest_size_then_smallest_lambda" = order(-df$size,  df$lambda),
-                      "largest_lambda"                    = order(-df$lambda),
-                      "smallest_lambda"                   = order(df$lambda)
-                      )
-        pick <- df$idx[ord][1]
-    }
-
-    list(index = pick, lambda = lambda[pick], eligible = eligible)
+    pick <- feasible[which.min(lambda[feasible])]
+    list(index = pick, lambda = lambda[pick], feasible = feasible)
 }
 
-## -------------------------------
-## 2) Learn-then-Test (fixed seqs)
-## -------------------------------
-
-## LTT over user-provided sequences (list of integer vectors of row indices).
-## Tests each sequence in order; within a sequence, continue while risk[j] ≤ alpha[j];
-## stop that sequence at the first failure. Each index is tested at most once overall.
-## 'mask' (if provided) skips indices that are FALSE.
-select_lambda_LTT <- function(lambda, risk, alpha, sequences,
-                              size = NULL, mask = NULL,
-                              tie = c("largest_size_then_largest_lambda",
-                                      "largest_lambda",
-                                      "largest_size_then_smallest_lambda",
-                                      "smallest_lambda")) {
+## Algorithm S4, lines 4-15: walk each path in order, stop it at its first
+## failure, and keep the most liberal (smallest) threshold accepted on any
+## path. Within a path the last accepted threshold is already the smallest
+## accepted on it, so this is exactly min{lambda_hat^(1), lambda_hat^(2)}.
+select_lambda_LTT <- function(lambda, risk, alpha, sequences) {
     stopifnot(length(lambda) == length(risk))
     K <- length(lambda)
-    if (!is.null(size)) stopifnot(length(size) == K)
-    if (!is.null(mask)) {
-        stopifnot(length(mask) == K)
-    } else {
-        mask <- rep(TRUE, K)
-    }
-    tie <- match.arg(tie)
     alpha_vec <- .align_alpha(alpha, K)
 
-    tested   <- rep(FALSE, K)
-    rejected <- rep(FALSE, K)
-
+    pick <- NA_integer_
     for (path in sequences) {
-        path <- unique(path[path >= 1 & path <= K])
-        for (j in path) {
-            if (!mask[j]) next                   ## skip ineligible indices
-            if (tested[j]) next                  ## already tested elsewhere
-            tested[j] <- TRUE
-            if (is.finite(risk[j]) && risk[j] <= alpha_vec[j]) {
-                rejected[j] <- TRUE                ## keep walking this path
-            } else {
-                break                              ## stop this path at first failure
-            }
+        for (j in unique(path[path >= 1 & path <= K])) {
+            if (!(is.finite(risk[j]) && risk[j] <= alpha_vec[j])) break   ## stop this path
+            if (is.na(pick) || lambda[j] < lambda[pick]) pick <- j        ## keep the most liberal
         }
     }
-    rej_idx <- which(rejected)
-    if (length(rej_idx) == 0) {
-        return(list(index = NA_integer_,
-                    lambda = NA_real_,
-                    rejected_indices = integer(0),
-                    tested_indices   = which(tested)))
-    }
-
-    ## Choose one λ among rejections
-    if (is.null(size)) {
-        pick <- switch(tie,
-                       "largest_lambda"                    = rej_idx[which.max(lambda[rej_idx])],
-                       "smallest_lambda"                   = rej_idx[which.min(lambda[rej_idx])],
-                       "largest_size_then_largest_lambda"  = rej_idx[which.max(lambda[rej_idx])],
-                       "largest_size_then_smallest_lambda" = rej_idx[which.min(lambda[rej_idx])]
-                       )
-    } else {
-        df <- data.frame(idx = rej_idx, size = size[rej_idx], lambda = lambda[rej_idx])
-        ord <- switch(tie,
-                      "largest_size_then_largest_lambda"  = order(-df$size, -df$lambda),
-                      "largest_lambda"                    = order(-df$lambda),
-                      "largest_size_then_smallest_lambda" = order(-df$size,  df$lambda),
-                      "smallest_lambda"                   = order(df$lambda)
-                      )
-        pick <- df$idx[ord][1]
-    }
-
-    list(index = pick,
-         lambda = lambda[pick],
-         rejected_indices = rej_idx,
-         tested_indices   = which(tested))
+    list(index  = pick,
+         lambda = if (is.na(pick)) NA_real_ else lambda[pick])
 }
 
-## -------------------------------------------------
-## Build LTT sequences from an anchor lambda value
-## -------------------------------------------------
-
-## Internal: find anchor index (on the lambda *scale*)
 .closest_anchor_index <- function(lambda, anchor,
                                   snap = c("closest","floor","ceiling")) {
     snap <- match.arg(snap)
@@ -207,15 +118,10 @@ build_sequences_from_anchors <- function(lambda, anchors,
 select_lambda_LTT_from_anchors <- function(lambda, risk, alpha,
                                            anchors,
                                            step_up = 1L, step_down = 1L,
-                                           snap = c("closest","floor","ceiling"),
-                                           size = NULL, mask = NULL,
-                                           tie = c("largest_size_then_largest_lambda",
-                                                   "largest_lambda",
-                                                   "largest_size_then_smallest_lambda",
-                                                   "smallest_lambda")) {
+                                           snap = c("closest","floor","ceiling")) {
     snap <- match.arg(snap)
     seqs <- build_sequences_from_anchors(lambda, anchors,
                                           step_up = step_up, step_down = step_down,
                                           snap = snap, include_anchor = TRUE, return = "both")
-    select_lambda_LTT(lambda, risk, alpha, sequences = seqs, size = size, mask = mask, tie = tie)
+    select_lambda_LTT(lambda, risk, alpha, sequences = seqs)
 }

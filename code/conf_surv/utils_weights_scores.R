@@ -33,7 +33,7 @@ fast_predict_at_times <- function(model, data, target_times, time_grid = NULL) {
 
 ## ---------------------------------------------------------
 ## IPCW weights (model-agnostic)
-##   - et: w_i = 1 / Ĝ(Y_i^-|Z_i) for events; non-events -> NA
+##   - et: w_i = 1 / Ĝ(Y_i|Z_i) for events; non-events -> NA
 ##   - ft: w_i = 1 / Ĝ(t0_i|Z_i)  for all i  (t0: scalar or length-n)
 ## ---------------------------------------------------------
 build_censor_time_grid <- function(time, status, t0 = NULL) {
@@ -99,7 +99,7 @@ compute_ipcw_weights <- function(
     }
 
     ## Winsorize extreme weights (top 'trim' fraction)
-    if (is.finite(trim) && trim > 0) {
+    if (length(trim) == 1L && is.finite(trim) && trim > 0) {   ## NULL / NA => no winsorization
         cap <- stats::quantile(w[is.finite(w)], probs = 1 - trim, na.rm = TRUE)
         w[w > cap] <- cap
     }
@@ -109,12 +109,12 @@ compute_ipcw_weights <- function(
 ## Convenience wrappers
 
 compute_ipcw_weights_et <- function(data, cens_model, time, status,
-                                    fast = TRUE, time_grid = NULL, trim = NULL) {
+                                    fast = TRUE, time_grid = NULL, trim = 0.01) {
     compute_ipcw_weights(data, cens_model, time, status, ipcw_method = "et",
                          t0 = NULL, fast = fast, time_grid = time_grid, trim = trim)
 }
 compute_ipcw_weights_ft <- function(data, cens_model, time, status, t0,
-                                    fast = TRUE, time_grid = NULL, trim = NULL) {
+                                    fast = TRUE, time_grid = NULL, trim = 0.01) {
     compute_ipcw_weights(data, cens_model, time, status, ipcw_method = "ft",
                          t0 = t0, fast = fast, time_grid = time_grid, trim = trim)
 }
